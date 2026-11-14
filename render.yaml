@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: galaga-flask
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # 워커 1개로 실행해야 scores.json 쓰기 락이 프로세스 간에 꼬이지 않음
+    startCommand: gunicorn app:app --workers 1 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
