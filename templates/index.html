@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Galaga - Flask</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="wrap">
+    <canvas id="game" width="600" height="800"
+            data-player="{{ url_for('static', filename='images/player.png') }}"
+            data-enemy="{{ url_for('static', filename='images/enemy.png') }}"
+            data-boss="{{ url_for('static', filename='images/boss.png') }}"></canvas>
+
+    <aside class="panel">
+      <h2>최고 점수</h2>
+      <div class="submit">
+        <input id="name" maxlength="12" value="PLAYER" placeholder="이름">
+        <button id="save" disabled>점수 등록</button>
+      </div>
+      <p id="status" class="status"></p>
+      <ol id="board"></ol>
+      <p class="help">
+        이동: 방향키 / WASD / 마우스 &nbsp; 발사: SPACE &nbsp; 미사일: Z &nbsp; 폭탄: X &nbsp; 재시작: R
+      </p>
+    </aside>
+  </main>
+  <script src="{{ url_for('static', filename='game.js') }}"></script>
+</body>
+</html>
