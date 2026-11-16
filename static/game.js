@@ -1,9 +1,10 @@
-// Galaga - Flask 웹 버전 (원본 Java GalagaGame.java의 규칙·수치를 그대로 옮김)
+// Galaga - Flask 웹 버전 (원본 Java 갤러그의 규칙·수치 기반, 난이도·아이템 확장)
 (() => {
   "use strict";
 
   const W = 600, H = 800;
-  const TICK_MS = 10; // 원본 Timer(10ms)와 같은 논리 틱
+  const TICK_MS = 10;            // 논리 틱 (100틱 = 1초)
+  const TICKS_PER_SEC = 1000 / TICK_MS;
 
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d");
@@ -24,13 +25,52 @@
   const overlaps = (a, b) =>
     a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 
-  // 별 배경은 고정 시드로 항상 같은 위치에 그림 (원본 Random(42)과 같은 의도)
+  function pickWeighted(list, weightOf) {
+    const total = list.reduce((s, v) => s + weightOf(v), 0);
+    let r = Math.random() * total;
+    for (const v of list) {
+      r -= weightOf(v);
+      if (r < 0) return v;
+    }
+    return list[list.length - 1];
+  }
+
+  // 별 배경은 고정 시드로 항상 같은 위치에 그림
   let seed = 42;
   const seeded = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
   const STARS = Array.from({ length: 80 }, () => [
     Math.floor(seeded() * 600),
     Math.floor(seeded() * 800),
   ]);
+
+  // ---------- 난이도 ----------
+  // shootMul: 적 발사 빈도 배율 (클수록 자주 쏨)
+  // speedMul: 이동 속도 배율 (클수록 빠름)
+  // hpMul   : 보스 체력 배율
+  const TIERS = [
+    { name: "쉬움",   color: "#7fff7f", shootMul: 0.75, speedMul: 0.85, hpMul: 0.8, weight: 3 },
+    { name: "보통",   color: "#ffd34d", shootMul: 1.0,  speedMul: 1.0,  hpMul: 1.0, weight: 4 },
+    { name: "어려움", color: "#ff6b6b", shootMul: 1.3,  speedMul: 1.2,  hpMul: 1.3, weight: 3 },
+  ];
+  const STAGES_PER_ROUND = 9;    // 9단계(최종 보스) 클리어 후 다음 라운드로 넘어감
+
+  const roundNo = () => Math.floor((G.state.level - 1) / STAGES_PER_ROUND) + 1;
+  const stageNo = () => ((G.state.level - 1) % STAGES_PER_ROUND) + 1;
+  const roundMul = () => 1 + 0.35 * (roundNo() - 1); // 라운드마다 난이도 35%씩 상승
+
+  // ---------- 아이템 ----------
+  const IT = { LIFE: 0, RAPID: 1, SHIELD: 2, DOUBLE: 3, PIERCE: 4, BOMB: 5, SCORE2: 6, SLOW: 7 };
+  const ITEMS = [
+    { color: "rgb(255,80,80)",   icon: "❤",  weight: 15 }, // LIFE
+    { color: "rgb(80,200,255)",  icon: "⚡", weight: 15 }, // RAPID (속사 3초)
+    { color: "rgb(80,255,120)",  icon: "🔰", weight: 10 }, // SHIELD (보호막 1.8초)
+    { color: "rgb(255,140,40)",  icon: "🔫", weight: 15 }, // DOUBLE (쌍발사 3초)
+    { color: "rgb(200,120,255)", icon: "🎯", weight: 12 }, // PIERCE (관통 3초)
+    { color: "rgb(255,220,80)",  icon: "💣", weight: 10 }, // BOMB (폭탄 즉시 충전)
+    { color: "rgb(255,215,0)",   icon: "💰", weight: 12 }, // SCORE2 (점수 2배 10초)
+    { color: "rgb(120,220,255)", icon: "🧊", weight: 11 }, // SLOW (적 감속 5초)
+  ];
+  const ITEM_TYPES = ITEMS.map((_, i) => i);
 
   // ---------- 바운드 ----------
   const bulletBox = (b) => ({ x: b.x - 2, y: b.y, w: 4, h: 10 });
@@ -44,7 +84,7 @@
 
   function newGame() {
     G = {
-      state: { score: 0, level: 1, lives: 3, gameOver: false, gameClear: false },
+      state: { score: 0, level: 1, lives: 3, gameOver: false },
       player: { x: 300, y: H - 80, inv: 0 },
       enemies: [],
       bullets: [],
@@ -58,11 +98,24 @@
       shootCd: 0,
       missileCd: 0,
       bombCd: 0,
-      rapid: 0,
+      fx: { rapid: 0, double: 0, pierce: 0, score2: 0, slow: 0 }, // 남은 틱
+      tier: TIERS[1],
+      banner: 0,
       submitted: false,
     };
     spawnEnemies();
+    beginStage();
     updateSubmitUI();
+  }
+
+  // 새 단계 시작: 난이도를 무작위로 뽑고 안내 배너 표시
+  function beginStage() {
+    G.tier = pickWeighted(TIERS, (t) => t.weight);
+    G.banner = 250;
+  }
+
+  function addScore(pts) {
+    G.state.score += G.fx.score2 > 0 ? pts * 2 : pts;
   }
 
   function spawnEnemies() {
@@ -73,12 +126,12 @@
         G.enemies.push({ x: startX + c * gapX, y: startY + r * gapY, hp: 1, points: 100, active: true });
   }
 
-  function makeBoss(level) {
-    const maxHp = 10 + level * 5;
+  function makeBoss() {
+    const maxHp = Math.round((10 + G.state.level * 5) * G.tier.hpMul * roundMul());
     return {
       x: W / 2, y: -80, targetY: 100,
       hp: maxHp, maxHp,
-      points: 1000 + level * 500,
+      points: 1000 + G.state.level * 500,
       phase: 1, moveDir: 1, moveTick: 0,
       entranceTick: 60,
       active: true,
@@ -88,20 +141,30 @@
   const bossEntering = (b) => b.entranceTick > 0;
 
   // ---------- 발사 / 아이템 ----------
+  // 플레이어 총알은 관통 효과가 켜져 있을 때만 hits 집합을 가짐
   function bullet(x, y, fromPlayer, dx = 0, dy = fromPlayer ? -12 : 5) {
-    return { x, y, dx, dy, fromPlayer, active: true };
+    const pierce = fromPlayer && G.fx.pierce > 0;
+    return { x, y, dx, dy, fromPlayer, active: true, hits: pierce ? new Set() : null };
   }
 
   function maybeDropItem(x, y) {
     if (Math.random() < 0.20) {
-      G.items.push({ x, y, type: Math.floor(Math.random() * 3), tick: 0, active: true });
+      const type = pickWeighted(ITEM_TYPES, (t) => ITEMS[t].weight);
+      G.items.push({ x, y, type, tick: 0, active: true });
     }
   }
-  // 0: LIFE, 1: RAPIDFIRE, 2: SHIELD
+
   function applyItem(type) {
-    if (type === 0) { if (G.state.lives < 5) G.state.lives++; }
-    else if (type === 1) { G.rapid = 300; }
-    else if (type === 2) { G.player.inv = Math.max(G.player.inv, 180); }
+    switch (type) {
+      case IT.LIFE:   if (G.state.lives < 5) G.state.lives++; break;
+      case IT.RAPID:  G.fx.rapid = 300; break;
+      case IT.SHIELD: G.player.inv = Math.max(G.player.inv, 180); break;
+      case IT.DOUBLE: G.fx.double = 300; break;
+      case IT.PIERCE: G.fx.pierce = 300; break;
+      case IT.BOMB:   G.bombCd = 0; break;
+      case IT.SCORE2: G.fx.score2 = 1000; break;
+      case IT.SLOW:   G.fx.slow = 500; break;
+    }
   }
 
   // ---------- 적 / 보스 ----------
@@ -112,13 +175,14 @@
 
   function killBoss() {
     G.boss = null;
-    G.state.score += 2000;
+    addScore(2000);
     G.state.level++;
     G.bossStage = false;
     spawnEnemies();
-    if (G.state.level > 9) G.state.gameClear = true;
+    beginStage();
   }
 
+  // 보스에 1 데미지. 처치되면 true
   function damageBoss() {
     G.boss.hp--;
     if (G.boss.hp <= 0) { killBoss(); return true; }
@@ -126,8 +190,11 @@
   }
 
   function updateEnemies() {
-    const { state } = G;
-    const speed = 15 - Math.min(state.level * 2, 10);
+    const lvl = G.state.level;
+    const slowMul = G.fx.slow > 0 ? 2 : 1;
+    const baseSpeed = 15 - Math.min(lvl * 2, 10);
+    const speed = Math.max(2, Math.round((baseSpeed * slowMul) / (G.tier.speedMul * roundMul())));
+
     G.enemyMoveTimer++;
     if (G.enemyMoveTimer >= speed) {
       G.enemyMoveTimer = 0;
@@ -142,13 +209,14 @@
       }
       // 적이 플레이어 라인까지 내려오면 게임오버
       for (const en of G.enemies) {
-        if (en.y > H - 80) { state.gameOver = true; return; }
+        if (en.y > H - 80) { G.state.gameOver = true; return; }
       }
     }
 
-    const shootInterval = Math.max(60 - state.level * 5, 20);
+    const baseInterval = Math.max(60 - lvl * 5, 20);
+    const interval = Math.max(8, Math.round((baseInterval * slowMul) / (G.tier.shootMul * roundMul())));
     G.enemyShootTimer++;
-    if (G.enemyShootTimer >= shootInterval && G.enemies.length > 0) {
+    if (G.enemyShootTimer >= interval && G.enemies.length > 0) {
       G.enemyShootTimer = 0;
       const shooter = G.enemies[Math.floor(Math.random() * G.enemies.length)];
       G.bullets.push(bullet(shooter.x, shooter.y + 44, false));
@@ -167,8 +235,10 @@
 
     b.phase = b.hp <= Math.floor(b.maxHp / 2) ? 2 : 1;
     b.moveTick++;
-    const level = G.state.level;
-    const speed = b.phase === 2 ? 2 + Math.floor(level / 2) : 1 + Math.floor(level / 3);
+    const lvl = G.state.level;
+    const slowMul = G.fx.slow > 0 ? 0.5 : 1;
+    const baseSpeed = b.phase === 2 ? 2 + Math.floor(lvl / 2) : 1 + Math.floor(lvl / 3);
+    const speed = baseSpeed * G.tier.speedMul * roundMul() * slowMul;
 
     b.x += b.moveDir * speed;
     if (b.phase === 2) {
@@ -178,7 +248,8 @@
     }
     if (b.x < 60 || b.x > W - 60) b.moveDir = -b.moveDir;
 
-    const shootRate = b.phase === 2 ? 50 : 80;
+    const baseRate = b.phase === 2 ? 50 : 80;
+    const shootRate = Math.max(20, Math.round(baseRate / (G.tier.shootMul * roundMul())));
     if (b.moveTick % shootRate === 0) {
       G.bullets.push(bullet(b.x - 20, b.y + 55, false));
       G.bullets.push(bullet(b.x, b.y + 55, false));
@@ -195,7 +266,7 @@
       for (const en of G.enemies) {
         if (en.active) {
           en.active = false;
-          G.state.score += en.points;
+          addScore(en.points);
           maybeDropItem(en.x, en.y);
         }
       }
@@ -214,25 +285,25 @@
 
     // 플레이어 총알 vs 적 / 보스
     for (const b of G.bullets) {
-      if (!b.fromPlayer) continue;
+      if (!b.fromPlayer || !b.active) continue;
       if (!G.bossStage) {
         for (const en of G.enemies) {
-          if (en.active && b.active && overlaps(bulletBox(b), enemyBox(en))) {
-            b.active = false;
-            en.hp--;
-            if (en.hp <= 0) {
-              en.active = false;
-              state.score += en.points;
-              maybeDropItem(en.x, en.y);
-            }
+          if (!en.active || !b.active) continue;
+          if (b.hits && b.hits.has(en)) continue;
+          if (!overlaps(bulletBox(b), enemyBox(en))) continue;
+          if (b.hits) b.hits.add(en); else b.active = false;
+          if (--en.hp <= 0) {
+            en.active = false;
+            addScore(en.points);
+            maybeDropItem(en.x, en.y);
           }
         }
         G.enemies = G.enemies.filter((en) => en.active);
       } else if (G.boss && !bossEntering(G.boss)) {
-        if (b.active && overlaps(bulletBox(b), bossBox(G.boss))) {
-          b.active = false;
-          damageBoss();
-        }
+        if (b.hits && b.hits.has(G.boss)) continue;
+        if (!overlaps(bulletBox(b), bossBox(G.boss))) continue;
+        if (b.hits) b.hits.add(G.boss); else b.active = false;
+        damageBoss();
       }
     }
 
@@ -258,10 +329,10 @@
     }
   }
 
-  // ---------- 한 틱 갱신 (원본 actionPerformed 순서 그대로) ----------
+  // ---------- 한 틱 갱신 (원본 actionPerformed 순서 기준) ----------
   function tick() {
-    const { state, player, keys } = G;
-    if (state.gameOver || state.gameClear) return;
+    const { state, player, keys, fx } = G;
+    if (state.gameOver) return;
 
     if (keys.left) player.x = Math.max(30, player.x - 6);
     if (keys.right) player.x = Math.min(W - 30, player.x + 6);
@@ -269,12 +340,15 @@
     if (keys.down) player.y = Math.min(H - 10, player.y + 6);
     if (player.inv > 0) player.inv--;
 
-    if (G.rapid > 0) G.rapid--;
-    const baseCd = G.rapid > 0 ? 7 : 18;
+    for (const k in fx) if (fx[k] > 0) fx[k]--;
+    if (G.banner > 0) G.banner--;
+
+    const baseCd = fx.rapid > 0 ? 7 : 18;
     const muzzleY = player.y - 30;
 
     if (keys.space && G.shootCd <= 0) {
-      G.bullets.push(bullet(player.x, muzzleY, true));
+      const offsets = fx.double > 0 ? [-10, 10] : [0];
+      for (const o of offsets) G.bullets.push(bullet(player.x + o, muzzleY, true));
       G.shootCd = baseCd;
     }
     if (G.shootCd > 0) G.shootCd--;
@@ -314,15 +388,16 @@
 
     checkCollisions();
 
-    // 레벨 클리어 판정 (3, 6, 9레벨은 보스전)
+    // 단계 클리어 판정: 단계 3, 6, 9는 보스전 (라운드마다 반복)
     if (!G.bossStage && G.enemies.length === 0 && !state.gameOver) {
-      if (state.level % 3 === 0) {
+      if (stageNo() % 3 === 0) {
         G.bossStage = true;
-        G.boss = makeBoss(state.level);
+        G.boss = makeBoss();
       } else {
         state.level++;
         G.enemyDir = 1;
         spawnEnemies();
+        beginStage();
       }
     }
   }
@@ -360,26 +435,24 @@
     }
   }
 
-  const ITEM_COLORS = ["rgb(255,80,80)", "rgb(80,200,255)", "rgb(80,255,120)"];
-  const ITEM_ICONS = ["❤", "⚡", "🔰"];
-
   function drawItem(it) {
     if (Math.floor(it.tick / 5) % 2 !== 0) return;
-    ctx.fillStyle = ITEM_COLORS[it.type];
+    const info = ITEMS[it.type];
+    ctx.fillStyle = info.color;
     ctx.beginPath();
     ctx.arc(it.x, it.y, 10, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = "#fff";
-    ctx.font = "bold 12px Arial";
+    ctx.font = "12px Arial";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(ITEM_ICONS[it.type], it.x, it.y + 1);
+    ctx.fillText(info.icon, it.x, it.y + 1);
     ctx.textAlign = "start";
     ctx.textBaseline = "alphabetic";
   }
 
   function drawBullet(b) {
-    if (b.fromPlayer && b.dx !== 0) ctx.fillStyle = "rgb(255,200,0)";
+    if (b.fromPlayer && b.hits) ctx.fillStyle = "rgb(200,120,255)";     // 관통탄
+    else if (b.fromPlayer && b.dx !== 0) ctx.fillStyle = "rgb(255,200,0)"; // 미사일
     else ctx.fillStyle = b.fromPlayer ? "cyan" : "red";
     ctx.fillRect(b.x - 2, b.y, 4, 10);
   }
@@ -389,12 +462,24 @@
     drawSprite("player", p.x - 30, p.y - 60, 60, 60);
   }
 
+  const FX_LABELS = [
+    ["rapid",  "⚡ 속사",     "rgb(80,200,255)"],
+    ["double", "🔫 쌍발사",   "rgb(255,140,40)"],
+    ["pierce", "🎯 관통",     "rgb(200,120,255)"],
+    ["score2", "💰 점수 2배", "rgb(255,215,0)"],
+    ["slow",   "🧊 감속",     "rgb(120,220,255)"],
+  ];
+
   function drawHUD() {
     const { state } = G;
     ctx.fillStyle = "#fff";
     ctx.font = "bold 16px Arial";
     ctx.fillText("SCORE: " + state.score, 10, 20);
     ctx.fillText("LEVEL: " + state.level, W / 2 - 30, 20);
+
+    ctx.font = "bold 13px Arial";
+    ctx.fillStyle = G.tier.color;
+    ctx.fillText(`ROUND ${roundNo()} · ${G.tier.name}`, W / 2 - 30, 40);
 
     ctx.fillStyle = "cyan";
     for (let i = 0; i < state.lives; i++) {
@@ -407,12 +492,20 @@
       ctx.fill();
     }
 
-    ctx.font = "13px Arial";
-    if (G.rapid > 0) {
-      ctx.fillStyle = "rgb(80,200,255)";
-      ctx.fillText("⚡RAPID:" + (Math.floor(G.rapid / 60) + 1) + "s", 10, 42);
+    // 활성 효과 목록 (남은 초)
+    const rows = [];
+    if (G.player.inv > 0) rows.push(["🔰 보호막", "rgb(80,255,120)", G.player.inv]);
+    for (const [key, label, color] of FX_LABELS) {
+      if (G.fx[key] > 0) rows.push([label, color, G.fx[key]]);
     }
+    ctx.font = "13px Arial";
+    rows.forEach(([label, color, ticks], i) => {
+      ctx.fillStyle = color;
+      ctx.fillText(`${label} ${Math.ceil(ticks / TICKS_PER_SEC)}s`, 10, 62 + i * 18);
+    });
+
     if (G.bombCd <= 0) {
+      ctx.font = "13px Arial";
       ctx.fillStyle = "rgb(255,160,0)";
       ctx.fillText("[X] BOMB READY", 10, H - 14);
     }
@@ -425,14 +518,26 @@
       ctx.font = "bold 28px Arial";
       ctx.fillText("⚠ BOSS INCOMING ⚠", W / 2 - 120, H / 2);
     }
+
+    // 단계 시작 배너
+    if (G.banner > 0) {
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 30px Arial";
+      ctx.fillText(`STAGE ${stageNo()}`, W / 2, H / 2 - 140);
+      ctx.fillStyle = G.tier.color;
+      ctx.font = "bold 22px Arial";
+      ctx.fillText(`${G.tier.name} 난이도`, W / 2, H / 2 - 108);
+      ctx.textAlign = "start";
+    }
   }
 
-  function drawOverlay(title, color) {
+  function drawGameOver() {
     ctx.fillStyle = "rgba(0,0,0,0.7)";
     ctx.fillRect(0, 0, W, H);
-    ctx.font = "bold 44px Arial";
-    ctx.fillStyle = color;
-    ctx.fillText(title, W / 2 - 130, H / 2 - 30);
+    ctx.font = "bold 48px Arial";
+    ctx.fillStyle = "red";
+    ctx.fillText("GAME OVER", W / 2 - 130, H / 2 - 30);
     ctx.font = "bold 24px Arial";
     ctx.fillStyle = "#fff";
     ctx.fillText("SCORE: " + G.state.score, W / 2 - 60, H / 2 + 20);
@@ -446,8 +551,7 @@
     ctx.fillRect(0, 0, W, H);
     drawStars();
 
-    if (G.state.gameOver) return drawOverlay("GAME OVER", "red");
-    if (G.state.gameClear) return drawOverlay("GAME CLEAR!", "yellow");
+    if (G.state.gameOver) return drawGameOver();
 
     for (const en of G.enemies) drawSprite("enemy", en.x - 22, en.y, 44, 44);
     if (G.boss) drawBoss(G.boss);
@@ -485,12 +589,12 @@
     if (action) G.keys[action] = true;
 
     if (e.code === "KeyX" && !e.repeat) {
-      if (G.bombCd <= 0 && !G.state.gameOver && !G.state.gameClear) {
+      if (G.bombCd <= 0 && !G.state.gameOver) {
         triggerBomb();
         G.bombCd = 180;
       }
     }
-    if (e.code === "KeyR" && (G.state.gameOver || G.state.gameClear)) newGame();
+    if (e.code === "KeyR" && G.state.gameOver) newGame();
   });
 
   document.addEventListener("keyup", (e) => {
@@ -530,7 +634,7 @@
   }
 
   function updateSubmitUI() {
-    const over = G.state.gameOver || G.state.gameClear;
+    const over = G.state.gameOver;
     saveBtn.disabled = !over || G.submitted;
     if (G.submitted) statusEl.textContent = "등록되었습니다.";
     else if (over) statusEl.textContent = "점수를 등록할 수 있습니다.";
@@ -568,7 +672,7 @@
       acc -= TICK_MS;
       tick();
     }
-    const over = G.state.gameOver || G.state.gameClear;
+    const over = G.state.gameOver;
     if (over !== wasOver) { wasOver = over; updateSubmitUI(); }
     render();
     requestAnimationFrame(frame);
